@@ -109,6 +109,11 @@ class ResponseCache:
             CacheEntry(key=query, value=value, created_at=time.time(), metadata=metadata or {})
         )
 
+    def flush(self) -> None:
+        """Remove all entries from cache (for testing)."""
+        self._entries = []
+        self.false_hit_log = []
+
     @staticmethod
     def similarity(a: str, b: str) -> float:
         """Compute semantic similarity between two strings using cosine over character n-grams + word tokens.
@@ -171,13 +176,26 @@ class SharedRedisCache:
         self.similarity_threshold = similarity_threshold
         self.prefix = prefix
         self.false_hit_log: list[dict[str, object]] = []
-        self._redis: Any = redis_lib.Redis.from_url(redis_url, decode_responses=True)
+        
+        # Local fallback cache for graceful degradation
+        self._fallback_cache = ResponseCache(ttl_seconds, similarity_threshold)
+        self._redis_down = False
+        
+        try:
+            self._redis: Any | None = redis_lib.Redis.from_url(redis_url, decode_responses=True)
+            self._redis.ping()
+        except Exception:
+            self._redis = None
+            self._redis_down = True
 
     def ping(self) -> bool:
         """Check Redis connectivity."""
+        if self._redis_down or self._redis is None:
+            return False
         try:
             return bool(self._redis.ping())
         except Exception:
+            self._redis_down = True
             return False
 
     def get(self, query: str) -> tuple[str | None, float]:
@@ -191,39 +209,46 @@ class SharedRedisCache:
         if _is_uncacheable(query):
             return None, 0.0
 
-        # Exact match first
-        exact_key = f"{self.prefix}{self._query_hash(query)}"
-        response = self._redis.hget(exact_key, "response")
-        if response:
-            return response, 1.0
+        if self._redis_down or self._redis is None:
+            return self._fallback_cache.get(query)
 
-        # Similarity scan
-        best_score = 0.0
-        best_response: str | None = None
-        best_cached_query: str | None = None
+        try:
+            # Exact match first
+            exact_key = f"{self.prefix}{self._query_hash(query)}"
+            response = self._redis.hget(exact_key, "response")
+            if response:
+                return response, 1.0
 
-        for k in self._redis.scan_iter(f"{self.prefix}*"):
-            cached_query = self._redis.hget(k, "query")
-            if cached_query is None:
-                continue
-            score = ResponseCache.similarity(query, cached_query)
-            if score > best_score:
-                best_score = score
-                best_response = self._redis.hget(k, "response")
-                best_cached_query = cached_query
+            # Similarity scan
+            best_score = 0.0
+            best_response: str | None = None
+            best_cached_query: str | None = None
 
-        if best_response is not None and best_score >= self.similarity_threshold:
-            if _looks_like_false_hit(query, best_cached_query or ""):
-                self.false_hit_log.append({
-                    "query": query,
-                    "cached_key": best_cached_query,
-                    "score": best_score,
-                    "reason": "date_or_number_mismatch",
-                })
-                return None, best_score
-            return best_response, best_score
+            for k in self._redis.scan_iter(f"{self.prefix}*"):
+                cached_query = self._redis.hget(k, "query")
+                if cached_query is None:
+                    continue
+                score = ResponseCache.similarity(query, cached_query)
+                if score > best_score:
+                    best_score = score
+                    best_response = self._redis.hget(k, "response")
+                    best_cached_query = cached_query
 
-        return None, best_score
+            if best_response is not None and best_score >= self.similarity_threshold:
+                if _looks_like_false_hit(query, best_cached_query or ""):
+                    self.false_hit_log.append({
+                        "query": query,
+                        "cached_key": best_cached_query,
+                        "score": best_score,
+                        "reason": "date_or_number_mismatch",
+                    })
+                    return None, best_score
+                return best_response, best_score
+
+            return None, best_score
+        except Exception:
+            self._redis_down = True
+            return self._fallback_cache.get(query)
 
     def set(self, query: str, value: str, metadata: dict[str, str] | None = None) -> None:
         """Store a response in Redis with TTL.
@@ -235,14 +260,28 @@ class SharedRedisCache:
         """
         if _is_uncacheable(query):
             return
-        key = f"{self.prefix}{self._query_hash(query)}"
-        self._redis.hset(key, mapping={"query": query, "response": value})
-        self._redis.expire(key, self.ttl_seconds)
+            
+        if self._redis_down or self._redis is None:
+            self._fallback_cache.set(query, value, metadata)
+            return
+
+        try:
+            key = f"{self.prefix}{self._query_hash(query)}"
+            self._redis.hset(key, mapping={"query": query, "response": value})
+            self._redis.expire(key, self.ttl_seconds)
+        except Exception:
+            self._redis_down = True
+            self._fallback_cache.set(query, value, metadata)
 
     def flush(self) -> None:
         """Remove all entries with this cache prefix (for testing)."""
-        for key in self._redis.scan_iter(f"{self.prefix}*"):
-            self._redis.delete(key)
+        self._fallback_cache.flush()
+        if not self._redis_down and self._redis is not None:
+            try:
+                for key in self._redis.scan_iter(f"{self.prefix}*"):
+                    self._redis.delete(key)
+            except Exception:
+                self._redis_down = True
 
     def close(self) -> None:
         """Close Redis connection."""

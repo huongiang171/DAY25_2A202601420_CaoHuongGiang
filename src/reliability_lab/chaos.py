@@ -73,37 +73,48 @@ def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig
     """Run a single named chaos scenario and collect metrics.
 
     1. Build gateway with provider overrides from scenario
-    2. Loop config.load_test.requests times
+    2. Submit requests concurrently via ThreadPoolExecutor
     3. Collect: total, success/fail, cache hits, fallback counts, latencies, cost
     4. Count circuit open transitions
     5. Calculate recovery time
     """
+    import concurrent.futures
+    import threading
+
     gateway = build_gateway(config, scenario.provider_overrides or None)
     metrics = RunMetrics()
+    
+    # Thread-safe lock for metrics
+    metrics_lock = threading.Lock()
 
-    for _ in range(config.load_test.requests):
+    def process_request() -> None:
         prompt = random.choice(queries)
         result = gateway.complete(prompt)
+        
+        with metrics_lock:
+            metrics.total_requests += 1
+            metrics.estimated_cost += result.estimated_cost
 
-        metrics.total_requests += 1
-        metrics.estimated_cost += result.estimated_cost
+            if result.cache_hit:
+                metrics.cache_hits += 1
+                metrics.estimated_cost_saved += 0.001
+                metrics.successful_requests += 1
+            elif result.route == "static_fallback":
+                metrics.static_fallbacks += 1
+                metrics.failed_requests += 1
+            elif result.route == "fallback":
+                metrics.fallback_successes += 1
+                metrics.successful_requests += 1
+            else:
+                # primary or cache_hit route
+                metrics.successful_requests += 1
 
-        if result.cache_hit:
-            metrics.cache_hits += 1
-            metrics.estimated_cost_saved += 0.001
-            metrics.successful_requests += 1
-        elif result.route == "static_fallback":
-            metrics.static_fallbacks += 1
-            metrics.failed_requests += 1
-        elif result.route == "fallback":
-            metrics.fallback_successes += 1
-            metrics.successful_requests += 1
-        else:
-            # primary or cache_hit route
-            metrics.successful_requests += 1
+            if result.latency_ms > 0:
+                metrics.latencies_ms.append(result.latency_ms)
 
-        if result.latency_ms > 0:
-            metrics.latencies_ms.append(result.latency_ms)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(process_request) for _ in range(config.load_test.requests)]
+        concurrent.futures.wait(futures)
 
     # Count circuit open transitions across all breakers
     metrics.circuit_open_count = sum(

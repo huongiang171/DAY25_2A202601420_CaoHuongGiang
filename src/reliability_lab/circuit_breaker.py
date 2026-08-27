@@ -37,6 +37,13 @@ class CircuitBreaker:
     success_count: int = 0
     opened_at: float | None = None
     transition_log: list[dict[str, str | float]] = field(default_factory=list)
+    redis_url: str | None = None
+    _redis: Any | None = field(default=None, init=False)
+
+    def __post_init__(self) -> None:
+        if self.redis_url:
+            import redis as redis_lib
+            self._redis = redis_lib.Redis.from_url(self.redis_url, decode_responses=True)
 
     def allow_request(self) -> bool:
         """Return whether a request should be attempted.
@@ -47,6 +54,15 @@ class CircuitBreaker:
           - If elapsed: transition to HALF_OPEN and allow
           - If not elapsed: deny (return False)
         """
+        # If using Redis, check global state first
+        if self._redis:
+            try:
+                global_state = self._redis.get(f"cb:{self.name}:state")
+                if global_state == "open":
+                    return False
+            except Exception:
+                pass # Fallback to local state
+
         if self.state == CircuitState.CLOSED:
             return True
         if self.state == CircuitState.HALF_OPEN:
@@ -88,6 +104,14 @@ class CircuitBreaker:
         """
         self.failure_count = 0
         self.success_count += 1
+        
+        if self._redis:
+            try:
+                self._redis.delete(f"cb:{self.name}:failures")
+                self._redis.delete(f"cb:{self.name}:state")
+            except Exception:
+                pass
+
         if self.state == CircuitState.HALF_OPEN and self.success_count >= self.success_threshold:
             self._transition(CircuitState.CLOSED, "probe_success")
             self.success_count = 0
@@ -108,6 +132,22 @@ class CircuitBreaker:
         """
         self.failure_count += 1
         self.success_count = 0
+        
+        # Redis distributed state sharing
+        if self._redis:
+            try:
+                fail_key = f"cb:{self.name}:failures"
+                state_key = f"cb:{self.name}:state"
+                count = self._redis.incr(fail_key)
+                self._redis.expire(fail_key, int(self.reset_timeout_seconds) or 1)
+                
+                if self.state == CircuitState.HALF_OPEN:
+                    self._redis.set(state_key, "open", ex=int(self.reset_timeout_seconds) or 1)
+                elif count >= self.failure_threshold:
+                    self._redis.set(state_key, "open", ex=int(self.reset_timeout_seconds) or 1)
+            except Exception:
+                pass
+                
         if self.state == CircuitState.HALF_OPEN:
             self._transition(CircuitState.OPEN, "probe_failure")
             self.opened_at = time.monotonic()
