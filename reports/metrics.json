@@ -1,0 +1,19 @@
+{
+  "total_requests": 300,
+  "availability": 0.9867,
+  "error_rate": 0.0133,
+  "latency_p50_ms": 271.07,
+  "latency_p95_ms": 317.34,
+  "latency_p99_ms": 492.34,
+  "fallback_success_rate": 0.956,
+  "cache_hit_rate": 0.5267,
+  "circuit_open_count": 2,
+  "recovery_time_ms": null,
+  "estimated_cost": 0.062238,
+  "estimated_cost_saved": 0.158,
+  "scenarios": {
+    "primary_timeout_100": "pass",
+    "primary_flaky_50": "pass",
+    "all_healthy": "fail"
+  }
+}
